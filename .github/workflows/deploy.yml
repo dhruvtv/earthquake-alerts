@@ -1,0 +1,239 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      deploy_backend:
+        description: 'Deploy backend (Cloud Functions)'
+        type: boolean
+        default: true
+      deploy_web:
+        description: 'Deploy web (Cloud Run)'
+        type: boolean
+        default: true
+
+env:
+  PROJECT_ID: gen-lang-client-0579637657
+  REGION: us-central1
+  FUNCTION_NAME: earthquake-monitor
+  WEB_SERVICE_NAME: earthquake-city
+  API_SERVICE_NAME: earthquake-api
+
+jobs:
+  # Detect which parts of the codebase changed
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      api: ${{ steps.filter.outputs.api }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'src/**'
+              - 'main.py'
+              - 'requirements.txt'
+              - 'env-vars.yaml'
+              - 'config/**'
+            api:
+              - 'api/**'
+            web:
+              - 'web/**'
+
+  # Run backend tests
+  test-backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest responses
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # Deploy backend (Cloud Functions)
+  deploy-backend:
+    needs: [changes, test-backend]
+    if: |
+      always() &&
+      (needs.test-backend.result == 'success' || needs.test-backend.result == 'skipped') &&
+      (needs.changes.outputs.backend == 'true' || (github.event_name == 'workflow_dispatch' && inputs.deploy_backend))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy Cloud Function (earthquake-monitor)
+        run: |
+          gcloud functions deploy ${{ env.FUNCTION_NAME }} \
+            --gen2 \
+            --runtime python311 \
+            --region ${{ env.REGION }} \
+            --source . \
+            --entry-point earthquake_monitor \
+            --trigger-http \
+            --allow-unauthenticated \
+            --memory 512MB \
+            --timeout 120s \
+            --env-vars-file env-vars.yaml
+
+      - name: Verify deployment
+        run: |
+          FUNCTION_URL=$(gcloud functions describe ${{ env.FUNCTION_NAME }} \
+            --region ${{ env.REGION }} \
+            --format='value(serviceConfig.uri)')
+          echo "Function URL: $FUNCTION_URL"
+
+          RESPONSE=$(curl -s -X POST "$FUNCTION_URL")
+          echo "Response: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"status"'; then
+            echo "Deployment verified successfully!"
+          else
+            echo "Deployment verification failed!"
+            exit 1
+          fi
+
+  # Deploy API (Cloud Run)
+  deploy-api:
+    needs: changes
+    if: needs.changes.outputs.api == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy API to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.API_SERVICE_NAME }} \
+            --source api/ \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --memory 256Mi \
+            --min-instances 0 \
+            --max-instances 10
+
+      - name: Verify API deployment
+        run: |
+          API_URL=$(gcloud run services describe ${{ env.API_SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format='value(status.url)')
+          echo "API URL: $API_URL"
+
+          # Test health endpoint
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/health")
+          echo "Health check status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "API deployment verified successfully!"
+          else
+            echo "API deployment verification failed!"
+            exit 1
+          fi
+
+  # Deploy web (Cloud Run)
+  deploy-web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true' || (github.event_name == 'workflow_dispatch' && inputs.deploy_web)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Get API URL
+        id: api-url
+        run: |
+          API_URL=$(gcloud run services describe ${{ env.API_SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format='value(status.url)' 2>/dev/null || echo "")
+          if [ -z "$API_URL" ]; then
+            # Fallback to expected URL format if service doesn't exist yet
+            API_URL="https://earthquake-api-793997436187.us-central1.run.app"
+          fi
+          echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Cloud Run
+        run: |
+          cd web
+          gcloud run deploy ${{ env.WEB_SERVICE_NAME }} \
+            --source . \
+            --region ${{ env.REGION }} \
+            --platform managed \
+            --allow-unauthenticated \
+            --port 8080 \
+            --memory 512Mi \
+            --set-env-vars "NEXT_PUBLIC_API_URL=${{ steps.api-url.outputs.api_url }}"
+
+      - name: Verify web deployment
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.WEB_SERVICE_NAME }} \
+            --region ${{ env.REGION }} \
+            --format='value(status.url)')
+          echo "Web URL: $SERVICE_URL"
+
+          # Test the service
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SERVICE_URL/sanramon")
+          echo "HTTP Status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Web deployment verified successfully!"
+          else
+            echo "Web deployment verification failed!"
+            exit 1
+          fi

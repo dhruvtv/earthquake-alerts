@@ -1,36 +1,52 @@
 # Earthquake Alerts
 
-A serverless earthquake monitoring application that fetches real-time earthquake data from USGS and sends configurable alerts to Slack channels.
+A serverless earthquake monitoring application that fetches real-time earthquake data from USGS and sends configurable alerts to Slack and Twitter/X.
+
+**Live Site**: [earthquake.city](https://earthquake.city) - Real-time earthquake monitoring for California
+
+**Live Twitter**: [@quake_alerts](https://x.com/quake_alerts) - Automated earthquake alerts for the Bay Area
 
 ## Features
 
 - **Real-time Monitoring**: Polls USGS Earthquake API for new events
+- **Web Dashboard**: [earthquake.city](https://earthquake.city) with interactive map and recent earthquakes
 - **Configurable Alerts**: Set magnitude thresholds, geographic bounds, and points of interest
-- **Multiple Channels**: Route different alert levels to different Slack channels
+- **Multiple Channels**: Route alerts to Slack, Twitter/X, and/or WhatsApp
+- **Twitter Integration**: Automatic tweets via [@quake_alerts](https://x.com/quake_alerts)
+- **WhatsApp Groups**: Send alerts to WhatsApp groups via Twilio
 - **Proximity Alerts**: Get notified when earthquakes occur near specific locations
 - **Deduplication**: Prevents duplicate alerts using Firestore persistence
-- **Serverless**: Runs on Google Cloud Functions with Cloud Scheduler
+- **Serverless**: Runs on Google Cloud (Cloud Functions + Cloud Run)
 
 ## Architecture
 
-This project follows the **Functional Core, Imperative Shell** pattern for clean separation of concerns and easy testing:
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           DEPLOYED SERVICES                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Cloud Scheduler ──▶ earthquake-monitor (Cloud Function)                    │
+│                      - Fetches USGS data                                    │
+│                      - Sends alerts to Slack/Twitter/WhatsApp               │
+│                      - Uses Firestore for deduplication                     │
+│                                                                             │
+│  earthquake.city ──▶ earthquake-city (Cloud Run - Next.js)                  │
+│                      - Web frontend with interactive map                    │
+│                      - Shows latest & recent earthquakes                    │
+│                             │                                               │
+│                             ▼                                               │
+│                      earthquake-api (Cloud Run - FastAPI)                   │
+│                      - /api-latest-earthquake                               │
+│                      - /api-recent-earthquakes                              │
+│                      - /api-locales                                         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    IMPERATIVE SHELL                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
-│  │ USGS Client │  │Slack Client │  │ Firestore Client    │  │
-│  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘  │
-└─────────┼────────────────┼─────────────────────┼────────────┘
-          │                │                     │
-          ▼                ▼                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    FUNCTIONAL CORE                          │
-│  • Earthquake parsing    • Alert rule evaluation            │
-│  • Geo calculations      • Message formatting               │
-│  • Deduplication logic   (All pure functions - no I/O)      │
-└─────────────────────────────────────────────────────────────┘
-```
+This project follows the **Functional Core, Imperative Shell** pattern:
+- **Functional Core** (`src/core/`): Pure functions for parsing, rules, formatting
+- **Imperative Shell** (`src/shell/`): I/O clients (USGS, Slack, Twitter, Firestore)
+- **Orchestrator**: Wires core and shell together
 
 ## Quick Start
 
@@ -172,17 +188,23 @@ monitoring_regions:
 
 # Alert channels with different thresholds
 alert_channels:
-  - name: "critical"
-    type: slack
-    webhook_url: "${SLACK_WEBHOOK_CRITICAL}"
-    rules:
-      min_magnitude: 5.0
-
+  # Slack channel
   - name: "all-earthquakes"
     type: slack
-    webhook_url: "${SLACK_WEBHOOK_ALL}"
+    webhook_url: "${secret:slack-webhook-url}"
     rules:
       min_magnitude: 2.5
+
+  # Twitter/X channel
+  - name: "quake-alerts-twitter"
+    type: twitter
+    credentials:
+      api_key: "${secret:twitter-api-key}"
+      api_secret: "${secret:twitter-api-secret}"
+      access_token: "${secret:twitter-access-token}"
+      access_token_secret: "${secret:twitter-access-token-secret}"
+    rules:
+      min_magnitude: 3.0
 
 # Proximity alerts for specific locations
 points_of_interest:
@@ -191,6 +213,58 @@ points_of_interest:
     longitude: -122.4194
     alert_radius_km: 50
 ```
+
+### Twitter/X Setup
+
+To add Twitter alerts:
+
+1. Create a Twitter Developer account at [developer.twitter.com](https://developer.twitter.com)
+2. Create a new app with **Read and Write** permissions
+3. Generate API Key, API Secret, Access Token, and Access Token Secret
+4. Store credentials in Secret Manager:
+
+```bash
+echo -n "YOUR_API_KEY" | gcloud secrets create twitter-api-key --data-file=-
+echo -n "YOUR_API_SECRET" | gcloud secrets create twitter-api-secret --data-file=-
+echo -n "YOUR_ACCESS_TOKEN" | gcloud secrets create twitter-access-token --data-file=-
+echo -n "YOUR_ACCESS_TOKEN_SECRET" | gcloud secrets create twitter-access-token-secret --data-file=-
+```
+
+5. Add the Twitter channel to your config (see example above)
+
+### WhatsApp Setup (via Twilio)
+
+To add WhatsApp alerts:
+
+1. Create a Twilio account at [twilio.com](https://www.twilio.com)
+2. Enable WhatsApp in your Twilio account ([WhatsApp setup](https://www.twilio.com/docs/whatsapp))
+3. Get your Account SID and Auth Token from the Twilio Console
+4. Get your WhatsApp-enabled phone number (sandbox or approved number)
+5. Store credentials in Secret Manager:
+
+```bash
+echo -n "YOUR_ACCOUNT_SID" | gcloud secrets create twilio-account-sid --data-file=-
+echo -n "YOUR_AUTH_TOKEN" | gcloud secrets create twilio-auth-token --data-file=-
+```
+
+6. Add the WhatsApp channel to your config:
+
+```yaml
+alert_channels:
+  - name: "earthquake-whatsapp"
+    type: whatsapp
+    credentials:
+      account_sid: "${secret:twilio-account-sid}"
+      auth_token: "${secret:twilio-auth-token}"
+      from_number: "+14155238886"  # Your Twilio WhatsApp number
+      to_numbers:
+        - "+1234567890"  # Recipient phone numbers
+        - "+0987654321"
+    rules:
+      min_magnitude: 4.0
+```
+
+**Note**: For the Twilio WhatsApp Sandbox, recipients must first send a message to your sandbox number to opt-in.
 
 ### Environment Variables
 
@@ -235,6 +309,13 @@ python -m src.main
 
 ```
 earthquake-alerts/
+├── api/                # FastAPI service (Cloud Run)
+│   ├── main.py         # API endpoints
+│   ├── requirements.txt
+│   └── Dockerfile
+├── web/                # Next.js frontend (Cloud Run)
+│   ├── app/            # App Router pages
+│   └── Dockerfile
 ├── src/
 │   ├── core/           # Functional Core (pure functions)
 │   │   ├── earthquake.py   # Data models & parsing
@@ -245,13 +326,18 @@ earthquake-alerts/
 │   ├── shell/          # Imperative Shell (I/O)
 │   │   ├── usgs_client.py      # USGS API
 │   │   ├── slack_client.py     # Slack webhooks
+│   │   ├── twitter_client.py   # Twitter/X API
+│   │   ├── whatsapp_client.py  # WhatsApp via Twilio
 │   │   ├── firestore_client.py # Dedup storage
 │   │   └── config_loader.py    # Configuration
 │   ├── orchestrator.py  # Wires core + shell
 │   └── main.py          # Cloud Function entry
-└── tests/
-    ├── core/            # Unit tests (fast, no mocks)
-    └── shell/           # Integration tests
+├── tests/
+│   ├── core/            # Unit tests (fast, no mocks)
+│   └── shell/           # Integration tests
+└── .github/workflows/
+    ├── ci.yml           # PR checks (tests + API sanity)
+    └── deploy.yml       # Deploy to GCP
 ```
 
 ## Alert Message Format

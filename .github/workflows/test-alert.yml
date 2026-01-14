@@ -1,0 +1,102 @@
+name: Send Test Alert
+
+# ⚠️  WARNING: This workflow sends REAL notifications!
+# - Slack: Messages real channels
+# - Twitter: Posts to @quake_alerts (PUBLIC!) - requires explicit opt-in
+# - WhatsApp: Sends to real phone numbers
+
+on:
+  workflow_dispatch:
+    inputs:
+      magnitude:
+        description: 'Earthquake magnitude for test'
+        required: false
+        default: '5.5'
+      location:
+        description: 'Location description'
+        required: false
+        default: '8km NE of San Ramon, CA'
+      channel:
+        description: 'Specific channel name (leave empty for Slack only)'
+        required: false
+        default: ''
+      include_twitter:
+        description: '⚠️ Include Twitter? (POSTS PUBLICLY to @quake_alerts!)'
+        type: boolean
+        default: false
+      slack_only:
+        description: 'Send to Slack channels only (safest option)'
+        type: boolean
+        default: true
+
+env:
+  PROJECT_ID: gen-lang-client-0579637657
+  REGION: us-central1
+
+jobs:
+  send-test-alert:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Send Test Alert
+        env:
+          GCP_PROJECT: ${{ env.PROJECT_ID }}
+          CONFIG_PATH: config/config-production.yaml
+        run: |
+          # Build command with safety flags
+          CMD="python scripts/send_test_alert.py --magnitude ${{ inputs.magnitude }} --location '${{ inputs.location }}'"
+
+          # Add channel filter if specified
+          if [ -n "${{ inputs.channel }}" ]; then
+            CMD="$CMD --channel '${{ inputs.channel }}'"
+          fi
+
+          # Add slack-only flag if enabled (default: true)
+          if [ "${{ inputs.slack_only }}" = "true" ]; then
+            CMD="$CMD --slack-only"
+          fi
+
+          # Add include-twitter flag if explicitly enabled
+          if [ "${{ inputs.include_twitter }}" = "true" ]; then
+            echo "⚠️  WARNING: Twitter posting is enabled - this will post PUBLICLY!"
+            CMD="$CMD --include-twitter"
+          fi
+
+          echo "Running: $CMD"
+          eval $CMD
+
+      - name: Verify Function Endpoint
+        run: |
+          FUNCTION_URL="https://us-central1-${{ env.PROJECT_ID }}.cloudfunctions.net/earthquake-monitor"
+          echo "Testing function at: $FUNCTION_URL"
+
+          RESPONSE=$(curl -s -X POST "$FUNCTION_URL")
+          echo "Response: $RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"status"'; then
+            echo "Function is healthy!"
+          else
+            echo "Warning: Unexpected response from function"
+          fi

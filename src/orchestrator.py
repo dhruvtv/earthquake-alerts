@@ -10,14 +10,23 @@ from dataclasses import dataclass
 
 from src.core.earthquake import Earthquake, parse_earthquakes
 from src.core.dedup import filter_already_alerted, compute_ids_to_store
-from src.core.formatter import format_slack_message, get_nearby_pois
+from src.core.formatter import (
+    format_slack_message,
+    format_twitter_message,
+    format_whatsapp_message,
+    get_nearby_pois,
+)
 from src.core.rules import AlertChannel, make_alert_decisions, AlertDecision
 from src.core.geo import BoundingBox, combine_bounds
+from src.core.static_map import create_map_config
 
 from src.core.config import Config
 from src.shell.usgs_client import USGSClient
 from src.shell.slack_client import SlackClient
+from src.shell.twitter_client import TwitterClient, TwitterCredentials
+from src.shell.whatsapp_client import WhatsAppClient, WhatsAppCredentials
 from src.shell.firestore_client import FirestoreClient, FirestoreConfig
+from src.shell.static_map_client import StaticMapClient
 
 
 logger = logging.getLogger(__name__)
@@ -79,7 +88,9 @@ class Orchestrator:
     - USGS client (fetches earthquake data)
     - Core functions (parsing, rules, formatting)
     - Firestore client (deduplication state)
-    - Slack client (sending notifications)
+    - Slack client (sending Slack notifications)
+    - Twitter client (sending tweets)
+    - WhatsApp client (sending WhatsApp messages via Twilio)
     """
 
     def __init__(
@@ -87,7 +98,10 @@ class Orchestrator:
         config: Config,
         usgs_client: USGSClient | None = None,
         slack_client: SlackClient | None = None,
+        twitter_client: TwitterClient | None = None,
+        whatsapp_client: WhatsAppClient | None = None,
         firestore_client: FirestoreClient | None = None,
+        static_map_client: StaticMapClient | None = None,
     ) -> None:
         """Initialize orchestrator with configuration.
 
@@ -95,11 +109,17 @@ class Orchestrator:
             config: Application configuration
             usgs_client: USGS client (created if not provided)
             slack_client: Slack client (created if not provided)
+            twitter_client: Twitter client (created if not provided)
+            whatsapp_client: WhatsApp client (created if not provided)
             firestore_client: Firestore client (created if not provided)
+            static_map_client: Static map client (created if not provided)
         """
         self.config = config
         self.usgs_client = usgs_client or USGSClient()
         self.slack_client = slack_client or SlackClient()
+        self.twitter_client = twitter_client or TwitterClient()
+        self.whatsapp_client = whatsapp_client or WhatsAppClient()
+        self.static_map_client = static_map_client or StaticMapClient()
         self.firestore_client = firestore_client or FirestoreClient(
             FirestoreConfig(
                 database=config.firestore_database,
@@ -139,6 +159,8 @@ class Orchestrator:
     ) -> AlertResult:
         """Send an alert for an earthquake to a channel.
 
+        Routes to the appropriate client based on channel_type.
+
         Args:
             earthquake: The earthquake to alert on
             channel: The channel to send to
@@ -153,6 +175,22 @@ class Orchestrator:
             max_distance_km=100,
         )
 
+        # Route based on channel type
+        if channel.channel_type == "twitter":
+            return self._send_twitter_alert(earthquake, channel, nearby_pois)
+        elif channel.channel_type == "whatsapp":
+            return self._send_whatsapp_alert(earthquake, channel, nearby_pois)
+        else:
+            # Default to Slack
+            return self._send_slack_alert(earthquake, channel, nearby_pois)
+
+    def _send_slack_alert(
+        self,
+        earthquake: Earthquake,
+        channel: AlertChannel,
+        nearby_pois: list[tuple],
+    ) -> AlertResult:
+        """Send an alert via Slack webhook."""
         # Format message (pure core function)
         payload = format_slack_message(
             earthquake,
@@ -171,6 +209,156 @@ class Orchestrator:
             channel=channel,
             success=response.success,
             error=response.error,
+        )
+
+    def _send_twitter_alert(
+        self,
+        earthquake: Earthquake,
+        channel: AlertChannel,
+        nearby_pois: list[tuple],
+    ) -> AlertResult:
+        """Send an alert via Twitter/X with map snapshot."""
+        # Check for credentials
+        if not channel.credentials:
+            return AlertResult(
+                earthquake=earthquake,
+                channel=channel,
+                success=False,
+                error="Twitter channel missing credentials",
+            )
+
+        # Convert credentials tuple to TwitterCredentials
+        creds_dict = dict(channel.credentials)
+        try:
+            twitter_creds = TwitterCredentials(
+                api_key=creds_dict["api_key"],
+                api_secret=creds_dict["api_secret"],
+                access_token=creds_dict["access_token"],
+                access_token_secret=creds_dict["access_token_secret"],
+            )
+        except KeyError as e:
+            return AlertResult(
+                earthquake=earthquake,
+                channel=channel,
+                success=False,
+                error=f"Twitter credentials missing key: {e}",
+            )
+
+        # Format tweet (pure core function)
+        tweet_text = format_twitter_message(
+            earthquake,
+            nearby_pois=nearby_pois,
+        )
+
+        # Generate map snapshot (pure config + shell I/O)
+        media_ids = None
+        map_config = create_map_config(
+            latitude=earthquake.latitude,
+            longitude=earthquake.longitude,
+            magnitude=earthquake.magnitude,
+        )
+        map_result = self.static_map_client.generate_map(map_config)
+
+        if map_result.success and map_result.image_bytes:
+            # Upload image to Twitter
+            upload_result = self.twitter_client.upload_media(
+                map_result.image_bytes,
+                twitter_creds,
+            )
+            if upload_result.success and upload_result.media_id:
+                media_ids = [upload_result.media_id]
+                logger.info("Map image uploaded for tweet: %s", upload_result.media_id)
+            else:
+                logger.warning(
+                    "Failed to upload map image: %s (continuing without image)",
+                    upload_result.error,
+                )
+        else:
+            logger.warning(
+                "Failed to generate map image: %s (continuing without image)",
+                map_result.error,
+            )
+
+        # Send tweet via shell (with or without media)
+        response = self.twitter_client.send_tweet(
+            tweet_text,
+            twitter_creds,
+            media_ids=media_ids,
+        )
+
+        return AlertResult(
+            earthquake=earthquake,
+            channel=channel,
+            success=response.success,
+            error=response.error,
+        )
+
+    def _send_whatsapp_alert(
+        self,
+        earthquake: Earthquake,
+        channel: AlertChannel,
+        nearby_pois: list[tuple],
+    ) -> AlertResult:
+        """Send an alert via WhatsApp (Twilio)."""
+        # Check for credentials
+        if not channel.credentials:
+            return AlertResult(
+                earthquake=earthquake,
+                channel=channel,
+                success=False,
+                error="WhatsApp channel missing credentials",
+            )
+
+        # Convert credentials tuple to WhatsAppCredentials
+        creds_dict = dict(channel.credentials)
+        try:
+            whatsapp_creds = WhatsAppCredentials(
+                account_sid=creds_dict["account_sid"],
+                auth_token=creds_dict["auth_token"],
+                from_number=creds_dict["from_number"],
+            )
+            # to_numbers is a tuple (converted from list in config)
+            to_numbers = creds_dict.get("to_numbers", ())
+            if isinstance(to_numbers, str):
+                to_numbers = (to_numbers,)
+        except KeyError as e:
+            return AlertResult(
+                earthquake=earthquake,
+                channel=channel,
+                success=False,
+                error=f"WhatsApp credentials missing key: {e}",
+            )
+
+        if not to_numbers:
+            return AlertResult(
+                earthquake=earthquake,
+                channel=channel,
+                success=False,
+                error="WhatsApp channel has no recipients (to_numbers)",
+            )
+
+        # Format message (pure core function)
+        message_text = format_whatsapp_message(
+            earthquake,
+            nearby_pois=nearby_pois,
+        )
+
+        # Send to all recipients
+        responses = self.whatsapp_client.send_to_group(
+            message_text,
+            list(to_numbers),
+            whatsapp_creds,
+        )
+
+        # Consider success if at least one message was sent
+        any_success = any(r.success for r in responses)
+        errors = [r.error for r in responses if r.error]
+
+        return AlertResult(
+            earthquake=earthquake,
+            channel=channel,
+            success=any_success,
+            error="; ".join(errors) if errors else None,
         )
 
     def _process_decision(self, decision: AlertDecision) -> list[AlertResult]:
@@ -284,13 +472,25 @@ class Orchestrator:
         for decision in decisions:
             results = self._process_decision(decision)
 
+            # Track success/failure for this earthquake
+            decision_successes = []
+            decision_failures = []
+
             for result in results:
                 if result.success:
                     alerts_sent.append(result)
-                    if result.earthquake not in successfully_alerted:
-                        successfully_alerted.append(result.earthquake)
+                    decision_successes.append(result)
                 else:
                     alerts_failed.append(result)
+                    decision_failures.append(result)
+
+            # Mark earthquake as alerted if ANY channel succeeded
+            # This prevents duplicate alerts to successful channels
+            # Trade-off: failed channels won't retry, but this is acceptable
+            # to avoid spamming users with duplicates
+            if decision_successes:
+                if decision.earthquake not in successfully_alerted:
+                    successfully_alerted.append(decision.earthquake)
 
         # Step 5: Update deduplication state
         if successfully_alerted:
